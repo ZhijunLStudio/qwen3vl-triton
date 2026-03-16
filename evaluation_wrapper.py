@@ -19,6 +19,7 @@ import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor
 import torch
 from collections import OrderedDict
+import time
 
 
 class VLMModel:
@@ -72,7 +73,7 @@ class VLMModel:
         # self._optimize_vision_encoder()
         
         # 2. KV Cache Management
-        # self._optimize_kv_cache()
+        self._optimize_kv_cache()
         
         # 3. Cross-modal Connector Optimization
         # self._optimize_cross_modal_connector()
@@ -94,11 +95,11 @@ class VLMModel:
             
             
         # 1. 初始化 LRU 缓存 (容量设为3，防止 OOM)
-        self.image_cache = OrderedDict()
-        self.cache_capacity = 3
+        # self.image_cache = OrderedDict()
+        # self.cache_capacity = 3
         
-        # 2. 启用跨模态拦截优化
-        self._optimize_cross_modal_connector()
+        # # 2. 启用跨模态拦截优化
+        # self._optimize_cross_modal_connector()
 
     
     # ================================================================
@@ -183,43 +184,43 @@ class VLMModel:
         if 'vision_encoder' not in self._optimizations_applied:
             self._optimizations_applied.append('vision_encoder')
     
-    def _optimize_kv_cache(self):
-        """
-        Optimize KV Cache management to reduce memory fragmentation.
+    # def _optimize_kv_cache(self):
+    #     """
+    #     Optimize KV Cache management to reduce memory fragmentation.
         
-        Optimization Directions:
-        1. Memory layout optimization (contiguous memory allocation)
-        2. Fragmentation-free allocation strategies
-        3. Efficient cache reuse patterns
-        4. Dynamic cache sizing
+    #     Optimization Directions:
+    #     1. Memory layout optimization (contiguous memory allocation)
+    #     2. Fragmentation-free allocation strategies
+    #     3. Efficient cache reuse patterns
+    #     4. Dynamic cache sizing
         
-        Implementation Steps:
-        1. Understand current KV cache implementation in model layers
-        2. Design memory-efficient cache allocation strategy
-        3. Implement custom KV cache allocator if needed
-        4. Apply optimizations via monkey patch or config modification
+    #     Implementation Steps:
+    #     1. Understand current KV cache implementation in model layers
+    #     2. Design memory-efficient cache allocation strategy
+    #     3. Implement custom KV cache allocator if needed
+    #     4. Apply optimizations via monkey patch or config modification
         
-        Target Components:
-        - self._model.config (cache configuration)
-        - Attention layers (KV cache allocation)
-        - Generation loop (cache management)
-        """
-        # Enable KV Cache first
-        self._model.config.use_cache = True
-        if hasattr(self._model.config, 'pad_token_id'):
-            if self._model.config.pad_token_id is None:
-                self._model.config.pad_token_id = self._model.config.eos_token_id
+    #     Target Components:
+    #     - self._model.config (cache configuration)
+    #     - Attention layers (KV cache allocation)
+    #     - Generation loop (cache management)
+    #     """
+    #     # Enable KV Cache first
+    #     self._model.config.use_cache = True
+    #     if hasattr(self._model.config, 'pad_token_id'):
+    #         if self._model.config.pad_token_id is None:
+    #             self._model.config.pad_token_id = self._model.config.eos_token_id
         
-        # TODO: Implement advanced KV Cache optimizations here
-        # 
-        # Example workflow:
-        # 1. from your_optimization import FragmentationFreeKVCache
-        # 2. for layer in self._model.model.layers:
-        # 3.     layer.attention.custom_kv_cache = FragmentationFreeKVCache()
-        # 4. Test: Monitor memory usage and generation speed
+    #     # TODO: Implement advanced KV Cache optimizations here
+    #     # 
+    #     # Example workflow:
+    #     # 1. from your_optimization import FragmentationFreeKVCache
+    #     # 2. for layer in self._model.model.layers:
+    #     # 3.     layer.attention.custom_kv_cache = FragmentationFreeKVCache()
+    #     # 4. Test: Monitor memory usage and generation speed
         
-        if 'kv_cache' not in self._optimizations_applied:
-            self._optimizations_applied.append('kv_cache')
+    #     if 'kv_cache' not in self._optimizations_applied:
+    #         self._optimizations_applied.append('kv_cache')
     
     def _optimize_cross_modal_connector(self):
         """
@@ -519,3 +520,156 @@ class VLMModel:
         
         if 'cross_modal' not in self._optimizations_applied:
             self._optimizations_applied.append('cross_modal_radix_cache')
+            
+            
+    def _optimize_kv_cache(self):
+        """
+        Level-2 Prefix Caching: 终极绝对安全版 (参数绑定 + Zero-Copy)
+        """
+        import functools
+        import inspect
+        from transformers.cache_utils import DynamicCache
+        from collections import OrderedDict
+        
+        print("[VLMModel] 🚀 启用终极 LLM Prefix KV Caching...")
+        
+        self.llm_kv_cache = OrderedDict()
+        self.llm_kv_cache_lens = {}
+        self.llm_cache_capacity = 3
+        
+        original_forward = self._model.forward
+        # 预先解析参数签名，速度极快
+        forward_sig = inspect.signature(original_forward)
+        
+        import time # 记得在文件头 import time
+        
+    def _optimize_kv_cache(self):
+        """
+        Level-2 Prefix Caching: 暴力探针 + 兼容 DynamicCache 版
+        """
+        import functools
+        from transformers.cache_utils import DynamicCache
+        from collections import OrderedDict
+        import time
+        
+        print("[VLMModel] 🚀 启用 LLM Prefix KV Caching (暴力探针版)...")
+        
+        self.llm_kv_cache = OrderedDict()
+        self.llm_kv_cache_lens = {}
+        self.llm_cache_capacity = 3
+        
+        original_forward = self._model.forward
+        
+        import time
+        
+    def _optimize_kv_cache(self):
+        """
+        Level-2 Prefix Caching: 官方 API 安全兼容版 + 绝对零拷贝
+        """
+        import functools
+        from transformers.cache_utils import DynamicCache
+        from collections import OrderedDict
+        import torch
+        
+        print("[VLMModel] 🚀 启用 LLM Prefix KV Caching (官方API安全版)...")
+        
+        self.llm_kv_cache = OrderedDict()
+        self.llm_kv_cache_lens = {}
+        self.llm_cache_capacity = 3
+        
+        original_forward = self._model.forward
+        
+    def _optimize_kv_cache(self):
+        """
+        Level-2 Prefix Caching: 终极通关版 (修复 cache_position 崩溃 + 绝对零拷贝)
+        """
+        import functools
+        from transformers.cache_utils import DynamicCache
+        from collections import OrderedDict
+        import torch
+        
+        print("[VLMModel] 🚀 启用顶级 LLM Prefix KV Caching (完美通关版)...")
+        
+        self.llm_kv_cache = OrderedDict()
+        self.llm_kv_cache_lens = {}
+        self.llm_cache_capacity = 3
+        
+        original_forward = self._model.forward
+        
+        @functools.wraps(original_forward)
+        def custom_forward(*args, **kwargs):
+            input_ids = kwargs.get('input_ids', args[0] if len(args) > 0 else None)
+            past_key_values = kwargs.get('past_key_values')
+            pixel_values = kwargs.get('pixel_values')
+            
+            # 兼容判断是否为首轮 Prefill
+            is_prefill = False
+            if past_key_values is None:
+                is_prefill = True
+            elif hasattr(past_key_values, 'get_seq_length') and past_key_values.get_seq_length() == 0:
+                is_prefill = True
+            elif isinstance(past_key_values, tuple) and len(past_key_values) == 0:
+                is_prefill = True
+
+            if is_prefill and pixel_values is not None and input_ids is not None:
+                img_hash = self._compute_image_hash(pixel_values)
+                
+                if img_hash in self.llm_kv_cache:
+                    print(f"\n[LLM Cache] ⚡⚡⚡ 命中顶级 LLM 记忆池！瞬间跳过全图！(Hash: {img_hash[-6:]})")
+                    self.llm_kv_cache.move_to_end(img_hash)
+                    
+                    prefix_len = self.llm_kv_cache_lens[img_hash]
+                    cached_cache = self.llm_kv_cache[img_hash]
+                    
+                    # 🚀 绝对零拷贝重组：只传指针，不复制显存！
+                    new_cache = DynamicCache()
+                    for i in range(len(cached_cache)):
+                        k, v = cached_cache[i]
+                        new_cache.update(k, v, i)
+                        
+                    kwargs['past_key_values'] = new_cache
+                    kwargs['input_ids'] = input_ids[:, prefix_len:]
+                    
+                    if kwargs.get('position_ids') is not None:
+                        kwargs['position_ids'] = kwargs['position_ids'][..., prefix_len:]
+                        
+                    # 💥 致命修复：切断 cache_position，防止 RoPE 维度崩溃！
+                    if kwargs.get('cache_position') is not None:
+                        kwargs['cache_position'] = kwargs['cache_position'][prefix_len:]
+                        
+                    kwargs['pixel_values'] = None
+                    if 'image_grid_thw' in kwargs:
+                        kwargs['image_grid_thw'] = None
+                        
+                    return original_forward(*args, **kwargs)
+                    
+                else:
+                    # 全量计算
+                    outputs = original_forward(*args, **kwargs)
+                    
+                    vision_end_mask = (input_ids[0] == 151653).nonzero(as_tuple=True)[0]
+                    if len(vision_end_mask) > 0 and hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
+                        prefix_len = vision_end_mask[0].item() + 1
+                        
+                        # 🚀 绝对零拷贝保存：不 clone()，直接存视图，省下 20ms！
+                        new_cache = DynamicCache()
+                        for i in range(len(outputs.past_key_values)):
+                            k, v = outputs.past_key_values[i]
+                            # Qwen3 的 KV shape: [batch, num_heads, seq_len, head_dim]
+                            new_cache.update(k[:, :, :prefix_len, :], v[:, :, :prefix_len, :], i)
+                            
+                        self.llm_kv_cache[img_hash] = new_cache
+                        self.llm_kv_cache_lens[img_hash] = prefix_len
+                        
+                        if len(self.llm_kv_cache) > self.llm_cache_capacity:
+                            oldest = next(iter(self.llm_kv_cache))
+                            del self.llm_kv_cache[oldest]
+                            del self.llm_kv_cache_lens[oldest]
+                            
+                    return outputs
+
+            # 非 Prefill 阶段
+            return original_forward(*args, **kwargs)
+
+        self._model.forward = custom_forward
+        self._optimizations_applied.append('llm_prefix_caching_final')
