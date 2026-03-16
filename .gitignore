@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.idea/
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Results
+result*.json
+data/
+
+# Output images (可视化输出)
+output_images/
+output_visualized/
+
+# Model weights (大模型文件不提交)
+Qwen3-VL-2B-Instruct/
+*.safetensors
+*.bin
+*.pt
+
+# Logs
+*.log
+
+# MacOS
+.DS_Store
+
+# Temp
+*.tmp
+*.swp
+*~
+
+
+README_CN.md
+README.md
