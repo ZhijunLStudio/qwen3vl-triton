@@ -17,7 +17,6 @@ import triton.language as tl
 import functools
 import os
 
-
 import torch
 import torch.nn as nn
 from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -28,71 +27,113 @@ import triton.language as tl
 import functools
 import os
 import torch.nn.functional as F
+import sys
 
 # ==============================================================================
-# 🌪️ Triton 极致融合 RMSNorm (一次性干掉 8 个 PyTorch 原生调度！)
+# 🌪️ 1. Triton 极速版 RMSNorm (保持不变)
 # ==============================================================================
-def next_power_of_2(n):
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    n += 1
-    return n
-
 @triton.jit
-def triton_rmsnorm_kernel(
-    X_ptr, W_ptr, Y_ptr,
-    stride_x, stride_y,
-    N, eps,
-    BLOCK_N: tl.constexpr
-):
+def rms_norm_kernel(x_ptr, y_ptr, w_ptr, stride_x, N, eps, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    X_ptr += pid * stride_x
-    Y_ptr += pid * stride_y
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    x_row_ptr = x_ptr + pid * stride_x
+    y_row_ptr = y_ptr + pid * stride_x
+    x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    sum_sq = tl.sum(x * x, axis=0)
+    mean_sq = sum_sq / N
+    rstd = 1.0 / tl.sqrt(mean_sq + eps)
+    y = x * rstd * w
+    tl.store(y_row_ptr + cols, y.to(tl.float16), mask=mask)
 
-    offs = tl.arange(0, BLOCK_N)
-    mask = offs < N
-
-    # 加载数据并转为 float32 保证精度
-    x = tl.load(X_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-
-    # 核心数学计算在 GPU 内部一气呵成
-    var = tl.sum(x * x, axis=0) / N
-    rsqrt = tl.math.rsqrt(var + eps)
-    
-    y = x * rsqrt * w
-    
-    # 存回显存
-    tl.store(Y_ptr + offs, y.to(tl.float16), mask=mask)
-
-class FastRMSNorm(nn.Module):
-    def __init__(self, weight, eps):
-        super().__init__()
-        self.weight = weight
-        self.eps = eps
-        self.N = weight.shape[0]
-        self.BLOCK_N = next_power_of_2(self.N)
-
-    def __call__(self, x):
-        original_shape = x.shape
-        x_2d = x.view(-1, self.N)
-        M = x_2d.shape[0]
-        y = torch.empty_like(x_2d)
-        
-        triton_rmsnorm_kernel[(M,)](
-            x_2d, self.weight, y,
-            x_2d.stride(0), y.stride(0),
-            self.N, self.eps,
-            BLOCK_N=self.BLOCK_N
-        )
-        return y.view(original_shape)
+def custom_rmsnorm_forward(self, hidden_states):
+    x = hidden_states.contiguous()
+    original_shape = x.shape
+    x_2d = x.view(-1, original_shape[-1])
+    M, N = x_2d.shape
+    y = torch.empty_like(x_2d)
+    BLOCK_SIZE = triton.next_power_of_2(N)
+    rms_norm_kernel[(M,)](x_2d, y, self.weight, x_2d.stride(0), N, self.variance_epsilon, BLOCK_SIZE=BLOCK_SIZE, num_warps=4)
+    return y.view(original_shape)
 
 # ==============================================================================
-# 👑 究极版 Triton W4A16 算子 (加入 Split-K 彻底榨干 GPU)
+# 🎯 2. TorchScript 融合版 Fast RoPE (绝对安全！消灭 3500 次 CPU 调度)
+# 利用 NVFuser 底层融合，完美兼容任何维度排布，绝不产生 NaN！
+# ==============================================================================
+@torch.jit.script
+def fused_rope_core(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    d = q.shape[-1] // 2
+    # 一次性提取，底层 C++ 自动融合内存访问
+    q1, q2 = q[..., :d], q[..., d:]
+    c1, c2 = cos[..., :d], cos[..., d:]
+    s1, s2 = sin[..., :d], sin[..., d:]
+    
+    q_out = torch.cat([q1 * c1 - q2 * s1, q2 * c2 + q1 * s2], dim=-1)
+    
+    k1, k2 = k[..., :d], k[..., d:]
+    k_out = torch.cat([k1 * c1 - k2 * s1, k2 * c2 + k1 * s2], dim=-1)
+    
+    return q_out, k_out
+
+def fast_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return fused_rope_core(q, k, cos, sin)
+
+# ==============================================================================
+# 🧠 3. Triton 工业版 SwiGLU (保持不变，已验证安全)
+# ==============================================================================
+@triton.jit
+def qwen_swiglu_kernel(
+    x_ptr, y_ptr,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    N: tl.constexpr, BLOCK_SIZE: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs_n < N
+    
+    gate_ptrs = x_ptr + pid_m * stride_xm + offs_n * stride_xn
+    up_ptrs = x_ptr + pid_m * stride_xm + (N + offs_n) * stride_xn
+    out_ptrs = y_ptr + pid_m * stride_ym + offs_n * stride_yn
+    
+    gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
+    
+    silu = gate * tl.sigmoid(gate)
+    out = silu * up
+    tl.store(out_ptrs, out.to(tl.float16), mask=mask)
+
+def fast_swiglu(gate_up, g_dim):
+    gate_up = gate_up.contiguous()
+    original_shape = gate_up.shape
+    x_2d = gate_up.view(-1, original_shape[-1])
+    M = x_2d.shape[0]
+    
+    y = torch.empty((M, g_dim), device=gate_up.device, dtype=torch.float16)
+    BLOCK_SIZE = 1024
+    grid = (M, triton.cdiv(g_dim, BLOCK_SIZE))
+    
+    qwen_swiglu_kernel[grid](
+        x_2d, y,
+        x_2d.stride(0), x_2d.stride(1),
+        y.stride(0), y.stride(1),
+        N=g_dim, BLOCK_SIZE=BLOCK_SIZE, num_warps=4
+    )
+    
+    new_shape = list(original_shape)
+    new_shape[-1] = g_dim
+    return y.view(*new_shape)
+
+
+
+# （这里保留你之前定义的 w4a16_gemv_slim_kernel_splitk, dequantize 和 SlimTritonINT4Linear 代码）
+
+# ==============================================================================
+# 👑 4. 你的核心遗产：Triton W4A16 Split-K 算子 (绝对不换，保持原样！)
 # ==============================================================================
 @triton.jit
 def w4a16_gemv_slim_kernel_splitk(
@@ -104,14 +145,12 @@ def w4a16_gemv_slim_kernel_splitk(
     SPLIT_K: tl.constexpr
 ):
     pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)  # 💥 新增 K 维度并行切片！
+    pid_k = tl.program_id(1)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = offs_n < N
-
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
-    # 每个 pid_k 只负责 K 维度的 1/SPLIT_K 的工作量！速度翻 8 倍！
     k_start = pid_k * BLOCK_K_PACKED
     k_step = SPLIT_K * BLOCK_K_PACKED
 
@@ -145,12 +184,9 @@ def w4a16_gemv_slim_kernel_splitk(
         acc += tl.sum(a_low[:, None].to(tl.float32) * w_low_fp16, axis=0)
         acc += tl.sum(a_high[:, None].to(tl.float32) * w_high_fp16, axis=0)
 
-    # 结果存入 Workspace (供后续 PyTorch 求和)
     w_ptrs = Workspace_ptr + pid_k * N + offs_n
     tl.store(w_ptrs, acc.to(tl.float16), mask=mask_n)
 
-
-# 原本的 Prefill 核保留不动
 @triton.jit
 def dequantize_w4a16_slim_kernel(
     B_packed_ptr, Scales_ptr, Zeros_packed_ptr, W_fp16_ptr,
@@ -163,52 +199,39 @@ def dequantize_w4a16_slim_kernel(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_k_p = offs_k_p < (K // 2)
     mask_n = offs_n < N
-    
     b_ptrs = B_packed_ptr + offs_k_p[:, None] * stride_bk + offs_n[None, :] * stride_bn
     b_packed = tl.load(b_ptrs, mask=mask_k_p[:, None] & mask_n[None, :], other=0)
     b_low = b_packed & 0x0F
     b_high = (b_packed >> 4) & 0x0F
-    
     group_idx = pid_k 
     s_ptrs = Scales_ptr + group_idx * N + offs_n
     scales = tl.load(s_ptrs, mask=mask_n, other=1.0)
-    
     z_ptrs = Zeros_packed_ptr + (group_idx // 2) * N + offs_n
     z_packed = tl.load(z_ptrs, mask=mask_n, other=0)
     zeros = (z_packed >> ((group_idx % 2) * 4)) & 0x0F
-    
     w_low_fp16 = (b_low.to(tl.float32) - zeros.to(tl.float32)[None, :]) * scales.to(tl.float32)[None, :]
     w_high_fp16 = (b_high.to(tl.float32) - zeros.to(tl.float32)[None, :]) * scales.to(tl.float32)[None, :]
-    
     w_ptrs_low = W_fp16_ptr + (offs_k_p * 2)[:, None] * stride_wk + offs_n[None, :] * stride_wn
     w_ptrs_high = W_fp16_ptr + (offs_k_p * 2 + 1)[:, None] * stride_wk + offs_n[None, :] * stride_wn
-    
     tl.store(w_ptrs_low, w_low_fp16.to(tl.float16), mask=mask_k_p[:, None] & mask_n[None, :])
     tl.store(w_ptrs_high, w_high_fp16.to(tl.float16), mask=mask_k_p[:, None] & mask_n[None, :])
 
-
 class SlimTritonINT4Linear(nn.Module):
-    def __init__(self, in_features, out_features, group_size=128, device="cuda:0"): # 增加了 device 参数
+    def __init__(self, in_features, out_features, group_size=128, device="cuda:0"):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.group_size = group_size
-        
         self.register_buffer('qweight', torch.empty((in_features // 2, out_features), dtype=torch.int8))
         self.register_buffer('scales', torch.empty((in_features // group_size, out_features), dtype=torch.float16))
         self.register_buffer('qzeros', torch.empty(((in_features // group_size) // 2, out_features), dtype=torch.int8))
-        
         self.BLOCK_N = 32
         self.BLOCK_K_PACKED = 64
-        self.SPLIT_K = 8  # 💥 核心！强行把 K 切成 8 份，启动 8 倍数量的线程块填满 GPU！
-        
+        self.SPLIT_K = 8
         self.decode_grid = (triton.cdiv(out_features, self.BLOCK_N), self.SPLIT_K)
         self.prefill_grid = (triton.cdiv((in_features // 2), self.BLOCK_K_PACKED), triton.cdiv(out_features, self.BLOCK_N))
-        
-        # 预分配工作区，接收 Split-K 的结果
         self.workspace = torch.empty((self.SPLIT_K, out_features), dtype=torch.float16, device=device)
 
-    # 💥 魔法：重写 __call__，直接绕过 nn.Module 那些龟速的 Hook！
     def __call__(self, x, *args, **kwargs):
         return self.forward(x)
 
@@ -217,31 +240,22 @@ class SlimTritonINT4Linear(nn.Module):
         x_2d = x.view(-1, self.in_features)
         M, K = x_2d.shape
         N = self.out_features
-        
         if M == 1:
             x_1d = x.view(-1)
             w4a16_gemv_slim_kernel_splitk[self.decode_grid](
                 x_1d, self.qweight, self.scales, self.qzeros, self.workspace,
                 K, N, 1, self.qweight.stride(0), self.qweight.stride(1),
-                group_size=self.group_size,
-                BLOCK_K_PACKED=self.BLOCK_K_PACKED,
-                BLOCK_N=self.BLOCK_N,
-                SPLIT_K=self.SPLIT_K,
-                num_warps=4, num_stages=3
+                group_size=self.group_size, BLOCK_K_PACKED=self.BLOCK_K_PACKED, BLOCK_N=self.BLOCK_N,
+                SPLIT_K=self.SPLIT_K, num_warps=4, num_stages=3
             )
-            # PyTorch 的 sum 是纯 C++ 算子，极快，收割 Split-K 结果
             c = self.workspace.sum(dim=0)
             return c.view(*original_shape[:-1], N)
         else:
             w_fp16 = torch.empty((K, N), device=x.device, dtype=torch.float16)
             dequantize_w4a16_slim_kernel[self.prefill_grid](
-                self.qweight, self.scales, self.qzeros, w_fp16,
-                K, N,
-                self.qweight.stride(0), self.qweight.stride(1),
-                w_fp16.stride(0), w_fp16.stride(1),
-                BLOCK_K_PACKED=self.BLOCK_K_PACKED,
-                BLOCK_N=self.BLOCK_N,
-                num_warps=4, num_stages=3
+                self.qweight, self.scales, self.qzeros, w_fp16, K, N,
+                self.qweight.stride(0), self.qweight.stride(1), w_fp16.stride(0), w_fp16.stride(1),
+                BLOCK_K_PACKED=self.BLOCK_K_PACKED, BLOCK_N=self.BLOCK_N, num_warps=4, num_stages=3
             )
             return torch.matmul(x, w_fp16)
 
@@ -340,17 +354,31 @@ class VLMModel:
             print(f"\n[Quant] ❌ 找不到 {dict_path}！请先运行 extract 脚本打包融合权重。\n")
             return
             
-        print("[Quant] 🚀 加载终极版【Split-K Triton + FastRMSNorm + 免疫Hook】算子！")
+        print("[Quant] 🚀 加载终极版【Split-K Triton + 篡改RMSNorm + FastRoPE + SwiGLU】算子！")
         quant_dict = torch.load(dict_path, map_location=self._device)
         replaced_count = 0
+
+        # =========================================================
+        # 💥 降维打击：【类级别】全局替换 RMSNorm 和 RoPE！
+        # =========================================================
+        RMSNormClass = type(self._model.model.language_model.layers[0].input_layernorm)
+        RMSNormClass.forward = custom_rmsnorm_forward
+        print(f"[Core] ✅ 成功在类级别篡改 {RMSNormClass.__name__} 为 Triton 实现！")
+
+        AttnClass = type(self._model.model.language_model.layers[0].self_attn)
+        attn_module = sys.modules[AttnClass.__module__]
+        if hasattr(attn_module, 'apply_rotary_pos_emb'):
+            attn_module.apply_rotary_pos_emb = fast_apply_rotary_pos_emb
+            print(f"[Core] ✅ 成功在 {attn_module.__name__} 注入 JIT Fast RoPE！")
+        # =========================================================
         
-        # 1. 免疫 Hook 的轻量 Proxy (用于 Attention)
         class FastProxy(nn.Module):
             def __init__(self, handler, attr_name):
                 super().__init__()
                 self.handler = handler
                 self.attr_name = attr_name
-            def __call__(self, *args, **kwargs):
+            # 💥 必须使用 forward！千万不要用 __call__，否则 PyTorch 钩子会出大乱子！
+            def forward(self, *args, **kwargs):
                 return getattr(self.handler, self.attr_name)
 
         class FusedQKVHandler(nn.Module):
@@ -362,22 +390,20 @@ class VLMModel:
                 self.v_dim = v_dim
                 self.saved_k = None
                 self.saved_v = None
-            def __call__(self, x, *args, **kwargs):
+            def forward(self, x, *args, **kwargs):
                 qkv = self.qkv_proj(x)
-                # 使用切片 (slicing) 替代 split，进一步降低 CPU 耗时
-                q = qkv[..., :self.q_dim]
-                self.saved_k = qkv[..., self.q_dim : self.q_dim + self.k_dim]
-                self.saved_v = qkv[..., self.q_dim + self.k_dim :]
+                # 切片后强制 contiguous，让下游无懈可击！
+                q = qkv[..., :self.q_dim].contiguous()
+                self.saved_k = qkv[..., self.q_dim : self.q_dim + self.k_dim].contiguous()
+                self.saved_v = qkv[..., self.q_dim + self.k_dim :].contiguous()
                 return q
 
-        # 2. 遍历替换
+
+
+        # 遍历替换
         for idx, layer in enumerate(self._model.model.language_model.layers):
             
-            # 🌪️【核弹级优化】替换 RMSNorm，彻底干掉 aten::mul, aten::pow 等调度瓶颈
-            if hasattr(layer, 'input_layernorm'):
-                layer.input_layernorm = FastRMSNorm(layer.input_layernorm.weight, layer.input_layernorm.variance_epsilon)
-            if hasattr(layer, 'post_attention_layernorm'):
-                layer.post_attention_layernorm = FastRMSNorm(layer.post_attention_layernorm.weight, layer.post_attention_layernorm.variance_epsilon)
+            # (不需要再对 RMSNorm 进行逐个修改了，类已经被我们在上面全局污染了)
 
             # ==========================================
             # 替换 Attention 层的 QKV
@@ -413,7 +439,7 @@ class VLMModel:
                 replaced_count += 4
 
             # ==========================================
-            # 🚀 替换 MLP 层：直接重写 Forward，砍掉一切 Proxy！
+            # 🚀 替换 MLP 层
             # ==========================================
             gu_key = f"layers.{idx}.mlp.gate_up_proj"
             if gu_key in quant_dict:
@@ -426,14 +452,10 @@ class VLMModel:
                 gu_proj.scales.copy_(gu_data['scales'])
                 gu_proj.qzeros.copy_(gu_data['qzeros'])
                 
-                # 挂载我们巨大的 Gate-Up 矩阵
                 layer.mlp.gate_up_proj = gu_proj
-                
-                # 删除原厂模型
                 del layer.mlp.gate_proj
                 del layer.mlp.up_proj
                 
-                # down_proj 正常替换
                 d_data = quant_dict[f"layers.{idx}.mlp.down_proj"]
                 down_proj = SlimTritonINT4Linear(layer.mlp.down_proj.in_features, layer.mlp.down_proj.out_features, 128, device=self._device).to(self._device)
                 down_proj.qweight.copy_(d_data['qweight'])
@@ -441,22 +463,22 @@ class VLMModel:
                 down_proj.qzeros.copy_(d_data['qzeros'])
                 layer.mlp.down_proj = down_proj
                 
-                # 💥 暴力重写当前层 MLP 的 Forward (连 Proxy 都不要了，速度拉满！)
+                # 在 _apply_quantization 里的替换逻辑
                 def fast_mlp_forward(x, mlp_layer=layer.mlp, g_dim=gate_dim):
                     gate_up = mlp_layer.gate_up_proj(x)
-                    # 高速切片
-                    gate = gate_up[..., :g_dim]
-                    up = gate_up[..., g_dim:]
-                    return mlp_layer.down_proj(F.silu(gate) * up)
+                    swiglu_out = fast_swiglu(gate_up, g_dim)
+                    return mlp_layer.down_proj(swiglu_out)
                 
-                # 替换方法
                 layer.mlp.forward = fast_mlp_forward
-                
+
+
                 replaced_count += 3
 
         torch.cuda.empty_cache()
-        print(f"[Quant] ✅ 成功实施算子融合与替换！共重构了 {replaced_count} 个接口！RMSNorm 已被彻底重写！")
-        self._optimizations_applied.append('quantization_triton_fused_int4_splitK_FastRMSNorm')
+        print(f"[Quant] ✅ 成功实施算子融合与替换！共重构了 {replaced_count} 个接口！")
+        self._optimizations_applied.append('quantization_triton_fused_int4_splitK_FastRMSNorm_RoPE')
+
+
 
 
 
