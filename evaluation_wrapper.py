@@ -225,12 +225,16 @@ class SlimTritonINT4Linear(nn.Module):
         self.register_buffer('qweight', torch.empty((in_features // 2, out_features), dtype=torch.int8))
         self.register_buffer('scales', torch.empty((in_features // group_size, out_features), dtype=torch.float16))
         self.register_buffer('qzeros', torch.empty(((in_features // group_size) // 2, out_features), dtype=torch.int8))
-        self.BLOCK_N = 32
+        
+        # 💥 最终优化：加倍算术强度，减少显存带宽压力
+        self.BLOCK_N = 64  
         self.BLOCK_K_PACKED = 64
         self.SPLIT_K = 8
+        
         self.decode_grid = (triton.cdiv(out_features, self.BLOCK_N), self.SPLIT_K)
         self.prefill_grid = (triton.cdiv((in_features // 2), self.BLOCK_K_PACKED), triton.cdiv(out_features, self.BLOCK_N))
         self.workspace = torch.empty((self.SPLIT_K, out_features), dtype=torch.float16, device=device)
+
 
     def __call__(self, x, *args, **kwargs):
         return self.forward(x)
@@ -354,30 +358,29 @@ class VLMModel:
             print(f"\n[Quant] ❌ 找不到 {dict_path}！请先运行 extract 脚本打包融合权重。\n")
             return
             
-        print("[Quant] 🚀 加载终极版【Split-K Triton + 篡改RMSNorm + FastRoPE + SwiGLU】算子！")
+        print("[Quant] 🚀 加载终极版【Split-K Triton + 篡改RMSNorm + FastRoPE + HF旁路融合】算子！")
         quant_dict = torch.load(dict_path, map_location=self._device)
         replaced_count = 0
 
         # =========================================================
-        # 💥 降维打击：【类级别】全局替换 RMSNorm 和 RoPE！
+        # 降维打击 1：【类级别】全局替换 RMSNorm 和 RoPE！
         # =========================================================
         RMSNormClass = type(self._model.model.language_model.layers[0].input_layernorm)
         RMSNormClass.forward = custom_rmsnorm_forward
-        print(f"[Core] ✅ 成功在类级别篡改 {RMSNormClass.__name__} 为 Triton 实现！")
-
+        
         AttnClass = type(self._model.model.language_model.layers[0].self_attn)
         attn_module = sys.modules[AttnClass.__module__]
         if hasattr(attn_module, 'apply_rotary_pos_emb'):
             attn_module.apply_rotary_pos_emb = fast_apply_rotary_pos_emb
-            print(f"[Core] ✅ 成功在 {attn_module.__name__} 注入 JIT Fast RoPE！")
-        # =========================================================
         
+        # =========================================================
+        # 恢复 Proxy 替身（专为 Prefill 阶段回退 HF 原生代码服务）
+        # =========================================================
         class FastProxy(nn.Module):
             def __init__(self, handler, attr_name):
                 super().__init__()
                 self.handler = handler
                 self.attr_name = attr_name
-            # 💥 必须使用 forward！千万不要用 __call__，否则 PyTorch 钩子会出大乱子！
             def forward(self, *args, **kwargs):
                 return getattr(self.handler, self.attr_name)
 
@@ -392,21 +395,15 @@ class VLMModel:
                 self.saved_v = None
             def forward(self, x, *args, **kwargs):
                 qkv = self.qkv_proj(x)
-                # 切片后强制 contiguous，让下游无懈可击！
                 q = qkv[..., :self.q_dim].contiguous()
                 self.saved_k = qkv[..., self.q_dim : self.q_dim + self.k_dim].contiguous()
                 self.saved_v = qkv[..., self.q_dim + self.k_dim :].contiguous()
                 return q
 
-
-
-        # 遍历替换
         for idx, layer in enumerate(self._model.model.language_model.layers):
             
-            # (不需要再对 RMSNorm 进行逐个修改了，类已经被我们在上面全局污染了)
-
             # ==========================================
-            # 替换 Attention 层的 QKV
+            # 替换 Attention 层：Prefill走代理，Decode走旁路！
             # ==========================================
             qkv_key = f"layers.{idx}.self_attn.qkv_proj"
             if qkv_key in quant_dict:
@@ -415,11 +412,14 @@ class VLMModel:
                 total_qkv_dim = q_dim + k_dim + v_dim
                 in_features = layer.self_attn.q_proj.in_features
                 
+                # 注入融合算子
                 qkv_proj = SlimTritonINT4Linear(in_features, total_qkv_dim, group_size=128, device=self._device).to(self._device)
                 qkv_proj.qweight.copy_(qkv_data['qweight'])
                 qkv_proj.scales.copy_(qkv_data['scales'])
                 qkv_proj.qzeros.copy_(qkv_data['qzeros'])
+                layer.self_attn.qkv_proj = qkv_proj
                 
+                # 删除原厂模型，挂载 Proxy 替身
                 del layer.self_attn.q_proj
                 del layer.self_attn.k_proj
                 del layer.self_attn.v_proj
@@ -436,6 +436,88 @@ class VLMModel:
                 o_proj.qzeros.copy_(o_data['qzeros'])
                 layer.self_attn.o_proj = o_proj
                 
+                # 💥 降维打击 2：定义 Decode 极速前向传播
+                lm_config = self._model.model.language_model.config
+                num_heads = lm_config.num_attention_heads
+                num_kv_heads = lm_config.num_key_value_heads
+                head_dim = lm_config.hidden_size // num_heads
+                num_rep = num_heads // num_kv_heads  
+
+                def get_fast_attn_forward(self_attn, original_forward, q_dim, k_dim, n_heads, n_kv_heads, h_dim, n_rep):
+                    scale = h_dim ** -0.5  # 预计算缩放因子
+                    def fast_attn_forward(hidden_states, attention_mask=None, position_ids=None, output_attentions=False, use_cache=False, cache_position=None, position_embeddings=None, **kwargs):
+                        
+                        past_key_values = kwargs.get('past_key_values', kwargs.get('past_key_value', None))
+                        
+                        # Prefill 阶段乖乖走老路（走完整的 FlashAttention）
+                        if hidden_states.shape[1] > 1 or output_attentions:
+                            return original_forward(
+                                hidden_states, attention_mask=attention_mask, position_ids=position_ids,
+                                output_attentions=output_attentions, use_cache=use_cache, 
+                                cache_position=cache_position, position_embeddings=position_embeddings, 
+                                **kwargs
+                            )
+                        
+                        # 🚀 Decode 阶段：十行代码，光速通行！
+                        qkv = self_attn.qkv_proj(hidden_states)
+                        q = qkv[..., :q_dim].contiguous()
+                        k = qkv[..., q_dim : q_dim + k_dim].contiguous()
+                        v = qkv[..., q_dim + k_dim :].contiguous()
+                        
+                        bsz, q_len, _ = hidden_states.size()
+                        
+                        q = q.view(bsz, q_len, n_heads, h_dim)
+                        k = k.view(bsz, q_len, n_kv_heads, h_dim)
+                        v = v.view(bsz, q_len, n_kv_heads, h_dim)
+                        
+                        if hasattr(self_attn, "q_norm") and self_attn.q_norm is not None:
+                            q = self_attn.q_norm(q)
+                            k = self_attn.k_norm(k)
+                            
+                        q = q.transpose(1, 2)
+                        k = k.transpose(1, 2)
+                        v = v.transpose(1, 2)
+                            
+                        if position_embeddings is None:
+                            cos, sin = self_attn.rotary_emb(v, position_ids)
+                        else:
+                            cos, sin = position_embeddings
+                            
+                        q, k = fast_apply_rotary_pos_emb(q, k, cos, sin)
+                        
+                        if past_key_values is not None:
+                            k, v = past_key_values.update(k, v, self_attn.layer_idx)
+                            
+                        # 💥 降维打击 3：抛弃 PyTorch SDPA，手写极速解码 Attention！
+                        # 彻底消灭 C++ Math 后台的回退惩罚！0 拷贝！光速穿透！
+                        if n_rep > 1:
+                            # 零拷贝维度折叠，对齐 GQA
+                            q = q.contiguous().view(bsz, n_kv_heads, n_rep * q_len, h_dim)
+                            
+                        # 纯天然 4D 矩阵乘法，极速调用底层 cuBLAS
+                        attn_weights = torch.matmul(q, k.transpose(2, 3)) * scale
+                        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+                        attn_output = torch.matmul(attn_weights, v)
+                        
+                        if n_rep > 1:
+                            # 完美复原
+                            attn_output = attn_output.view(bsz, n_heads, q_len, h_dim)
+                            
+                        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+                        attn_output = self_attn.o_proj(attn_output)
+                        
+                        return (attn_output, past_key_values)
+                        
+                    return fast_attn_forward
+
+                
+                # 挂载光速通道
+                layer.self_attn.forward = get_fast_attn_forward(
+                    layer.self_attn, layer.self_attn.forward, q_dim, k_dim, 
+                    num_heads, num_kv_heads, head_dim, num_rep
+                )
+
+
                 replaced_count += 4
 
             # ==========================================
@@ -463,20 +545,17 @@ class VLMModel:
                 down_proj.qzeros.copy_(d_data['qzeros'])
                 layer.mlp.down_proj = down_proj
                 
-                # 在 _apply_quantization 里的替换逻辑
                 def fast_mlp_forward(x, mlp_layer=layer.mlp, g_dim=gate_dim):
                     gate_up = mlp_layer.gate_up_proj(x)
                     swiglu_out = fast_swiglu(gate_up, g_dim)
                     return mlp_layer.down_proj(swiglu_out)
                 
                 layer.mlp.forward = fast_mlp_forward
-
-
                 replaced_count += 3
 
         torch.cuda.empty_cache()
-        print(f"[Quant] ✅ 成功实施算子融合与替换！共重构了 {replaced_count} 个接口！")
-        self._optimizations_applied.append('quantization_triton_fused_int4_splitK_FastRMSNorm_RoPE')
+        print(f"[Quant] ✅ 成功实施终极剥离！共重构了 {replaced_count} 个接口！")
+        self._optimizations_applied.append('quantization_triton_fused_int4_splitK_FastRMSNorm_RoPE_HF_Bypass')
 
 
 
