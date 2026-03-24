@@ -8,7 +8,6 @@ Note:
 - Your optimizations should modify self.model or its operators in __init__ via Monkey Patch.
 - The generate() method is optional and mainly for debugging.
 """
-import os
 from typing import Dict
 try:
     from PIL import Image
@@ -44,11 +43,12 @@ class VLMModel:
             device: CUDA device, e.g., "cuda:0"
         """
         self._device = device
+        self.device = device  # 供 benchmark.py 访问
         self.model_path = model_path
         
-        # Load processor
         print(f"[VLMModel] Loading processor from {model_path}...")
         self._processor = AutoProcessor.from_pretrained(model_path)
+        self.processor = self._processor  # 供 benchmark.py 访问
         
         # Load model
         print(f"[VLMModel] Loading model with FP16...")
@@ -61,36 +61,26 @@ class VLMModel:
         
         # Track applied optimizations
         self._optimizations_applied = []
-
-        # Basic runtime tuning first (safe and usually beneficial)
-        self._configure_runtime()
         
         # ================================================================
         # Participant Optimization Area - Enable/disable optimizations here
         # Uncomment the optimization methods you want to apply
         # ================================================================
         
-        # 1. Vision Encoder optimization (layout-level, low risk)
-        self._optimize_vision_encoder()
-
+        # 1. Vision Encoder Acceleration
+        # self._optimize_vision_encoder()
+        
         # 2. KV Cache Management
-        self._optimize_kv_cache()
-
-        # 3. Cross-modal Connector Optimization (safe fallback, no-op by default)
-        self._optimize_cross_modal_connector()
-
-        # 4. Flash/SDPA optimization
-        self._enable_flash_attention()
-
-        # 5. Optional quantization entrypoint (disabled by default)
+        # self._optimize_kv_cache()
+        
+        # 3. Cross-modal Connector Optimization
+        # self._optimize_cross_modal_connector()
+        
+        # 4. Flash Attention Optimization
+        # self._enable_flash_attention()
+        
+        # 5. Quantization
         # self._apply_quantization()
-
-        # 6. Wrap generate with inference/autocast context
-        self._patch_generate_for_inference()
-
-        # 7. Optional compile path (set env AICAS_ENABLE_COMPILE=1)
-        if os.getenv("AICAS_ENABLE_COMPILE", "0") == "1":
-            self._try_compile_model()
         
         # Optional: Explore model structure before optimization
         # self._explore_model_structure()
@@ -100,25 +90,6 @@ class VLMModel:
         print(f"[VLMModel] Model loaded successfully on {device}")
         if self._optimizations_applied:
             print(f"[VLMModel] Applied optimizations: {', '.join(self._optimizations_applied)}")
-
-    def _configure_runtime(self):
-        """Apply conservative runtime settings for inference speed."""
-        torch.set_grad_enabled(False)
-
-        if torch.cuda.is_available():
-            # Allow TensorCore-friendly matmul paths on Ampere+.
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
-
-        # Prefer faster kernels for fp32 fallback ops.
-        try:
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
-
-        if "runtime_tuning" not in self._optimizations_applied:
-            self._optimizations_applied.append("runtime_tuning")
     
     # ================================================================
     # Optimization Methods - Implement your optimizations here
@@ -191,12 +162,13 @@ class VLMModel:
         - Vision encoder layers and attention mechanisms
         - Convolution operations in patch embedding
         """
-        # A low-risk baseline optimization: channels_last for convolution-heavy blocks.
-        # If the underlying model implementation does not support it, silently skip.
-        try:
-            self._model = self._model.to(memory_format=torch.channels_last)
-        except Exception:
-            pass
+        # TODO: Implement your Vision Encoder optimization here
+        # 
+        # Example workflow:
+        # 1. from your_optimization import optimized_attention, optimized_conv
+        # 2. Inspect: print(self._model.vision_model) to find target layers
+        # 3. Replace: layer.self_attn.forward = optimized_attention
+        # 4. Test: Run benchmark to verify improvement
         
         if 'vision_encoder' not in self._optimizations_applied:
             self._optimizations_applied.append('vision_encoder')
@@ -227,19 +199,6 @@ class VLMModel:
         if hasattr(self._model.config, 'pad_token_id'):
             if self._model.config.pad_token_id is None:
                 self._model.config.pad_token_id = self._model.config.eos_token_id
-
-        # Keep generation config in sync with model config.
-        if hasattr(self._model, "generation_config"):
-            self._model.generation_config.use_cache = True
-            if getattr(self._model.generation_config, "pad_token_id", None) is None:
-                self._model.generation_config.pad_token_id = self._model.config.pad_token_id
-
-            # Static cache can reduce allocator overhead on repeated generation.
-            if hasattr(self._model.generation_config, "cache_implementation"):
-                try:
-                    self._model.generation_config.cache_implementation = "static"
-                except Exception:
-                    pass
         
         # TODO: Implement advanced KV Cache optimizations here
         # 
@@ -271,7 +230,14 @@ class VLMModel:
         Note: Qwen3-VL's cross-modal structure may vary.
         Use model exploration to identify actual component names and locations.
         """
-        # Safe baseline keeps this as a no-op hook for future custom kernels.
+        # TODO: Implement your Cross-modal Connector optimization here
+        # 
+        # Example workflow:
+        # 1. Explore: self._explore_model_structure() to find connector components
+        # 2. from your_optimization import optimized_cross_attention
+        # 3. Identify: Inspect model to find cross-attention layers
+        # 4. Replace: connector.cross_attention.forward = optimized_cross_attention
+        # 5. Test: Verify accuracy and performance improvements
         
         if 'cross_modal' not in self._optimizations_applied:
             self._optimizations_applied.append('cross_modal')
@@ -296,20 +262,18 @@ class VLMModel:
         Recommended: Implement Approach 2 for better performance gains.
         Use profiling to identify which attention operations benefit most from optimization.
         """
-        if torch.cuda.is_available() and hasattr(torch.backends, "cuda"):
-            try:
-                torch.backends.cuda.enable_flash_sdp(True)
-                torch.backends.cuda.enable_mem_efficient_sdp(True)
-                torch.backends.cuda.enable_math_sdp(True)
-            except Exception:
-                pass
-
-        # HuggingFace models may honor this flag at runtime.
-        if hasattr(self._model, "config") and hasattr(self._model.config, "attn_implementation"):
-            try:
-                self._model.config.attn_implementation = "sdpa"
-            except Exception:
-                pass
+        # TODO: Choose and implement your Flash Attention approach
+        
+        # Approach 1: Simple (enable PyTorch built-in)
+        # torch.backends.cuda.enable_flash_sdp(True)
+        
+        # Approach 2: Advanced (custom implementation - recommended)
+        # from your_optimization import custom_flash_attention
+        # torch.nn.functional.scaled_dot_product_attention = custom_flash_attention
+        # 
+        # Or replace at layer level:
+        # for layer in self._model.model.layers:
+        #     layer.self_attn.forward = custom_attention_with_flash
         
         if 'flash_attention' not in self._optimizations_applied:
             self._optimizations_applied.append('flash_attention')
@@ -333,39 +297,16 @@ class VLMModel:
         Note: Quantization may require reloading the model with quantization config.
         Consider applying quantization before other optimizations if model reload is needed.
         """
-        # This method is intentionally left as opt-in because quantization often
-        # requires environment-specific dependencies and model reload paths.
+        # TODO: Implement your quantization here
+        # 
+        # Example workflow:
+        # 1. from transformers import BitsAndBytesConfig
+        # 2. quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+        # 3. Note: May need to reload model with quantization config
+        # 4. Test: Verify accuracy and performance improvements
         
         if 'quantization' not in self._optimizations_applied:
             self._optimizations_applied.append('quantization')
-
-    def _patch_generate_for_inference(self):
-        """Wrap model.generate in inference_mode/autocast to reduce overhead."""
-        original_generate = self._model.generate
-
-        def optimized_generate(*args, **kwargs):
-            with torch.inference_mode():
-                if torch.cuda.is_available():
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        return original_generate(*args, **kwargs)
-                return original_generate(*args, **kwargs)
-
-        self._model.generate = optimized_generate
-
-        if 'patched_generate' not in self._optimizations_applied:
-            self._optimizations_applied.append('patched_generate')
-
-    def _try_compile_model(self):
-        """Best-effort torch.compile path; safe fallback on failure."""
-        if not hasattr(torch, "compile"):
-            return
-
-        try:
-            self._model = torch.compile(self._model, mode="reduce-overhead", fullgraph=False)
-            if 'torch_compile' not in self._optimizations_applied:
-                self._optimizations_applied.append('torch_compile')
-        except Exception as e:
-            print(f"[VLMModel] torch.compile skipped: {e}")
     
     # Required properties for benchmark
     @property
