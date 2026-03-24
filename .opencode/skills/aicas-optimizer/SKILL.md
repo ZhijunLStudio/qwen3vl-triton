@@ -20,6 +20,7 @@ description: "AICAS 2026 VLM模型自动优化器 - 基于现有evaluation_wrapp
 - **TTFT**: 65.47 ms
 - **吞吐量**: 65.43 tokens/sec  
 - **类别命中率**: 35% (7/20) - 通过 compute_accuracy.py 计算
+- **加权总分**: 待计算
 
 ## 现有基础
 1. **evaluation_wrapper.py** - 已有的优化版本（基于 evaluation_wrapper-origin.py）
@@ -36,6 +37,12 @@ source /data/lizhijun/anaconda3/bin/activate torch && python compute_accuracy.py
 ```
 
 逻辑：检查模型生成的答案是否包含该图片的 image_classes 类别标签中的任意一个。
+
+## 加权总分计算
+每次优化后计算：
+- 加权总分 = 准确率×0.4 + TTFT提升率×0.3 + 吞吐量提升率×0.3
+- TTFT提升率 = (基准TTFT - 当前TTFT) / 基准TTFT
+- 吞吐量提升率 = (当前吞吐量 - 基准吞吐量) / 基准吞吐量
 
 ## 代码整理规范
 优化后的代码必须放在 `optimizer/` 目录下，保持整洁：
@@ -125,12 +132,29 @@ source /data/lizhijun/anaconda3/bin/activate torch && export CUDA_VISIBLE_DEVICE
 source /data/lizhijun/anaconda3/bin/activate torch && python compute_accuracy.py --result result.json
 ```
 
+## Git 提交和推送（每次有提升时执行）
+当加权总分相比上次有提升时，执行：
+
+```bash
+git add ./
+git commit -m "优化: TTFT=Xms, 吞吐量=Y tokens/s, 命中率=Z%"
+git push origin main
+```
+
+注意：如果 push 失败，可能需要先启动代理：
+```bash
+proxy  # 启用代理
+git push origin main
+unproxy  # 关闭代理
+```
+
 ## 优化记录
 每次优化后，必须更新 `optimization_log.json`，记录：
 - 优化内容描述
 - TTFT 变化
 - 吞吐量变化
 - 类别命中率变化
+- 加权总分
 - 是否满足终止条件
 
 ## 终止条件
@@ -158,3 +182,4 @@ source /data/lizhijun/anaconda3/bin/activate torch && python compute_accuracy.py
 5. **使用第8张卡**: CUDA_VISIBLE_DEVICES=7
 6. **测试样本数**: 20 用于快速验证
 7. **每次优化后都要运行 benchmark + compute_accuracy**: 验证性能
+8. **Git操作**: 每次加权总分提升时自动 commit 和 push

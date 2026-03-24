@@ -22,6 +22,8 @@ ENV/
 
 # Results
 result*.json
+optimization_log.json
+*.json.bak
 data/
 
 # Output images (可视化输出)
