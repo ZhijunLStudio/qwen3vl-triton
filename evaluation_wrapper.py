@@ -276,8 +276,23 @@ class VLMModel:
         self._processor = AutoProcessor.from_pretrained(model_path)
         
         print(f"[VLMModel] Loading model with FP16...")
+        
+        # Enable CUDA memory allocator for better performance
+        torch.cuda.set_per_process_memory_fraction(1.0)
+        
+        # Enable TF32 for faster matmul on Ampere GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision('high')
+        
+        # Enable cuDNN auto-tuner
+        torch.backends.cudnn.benchmark = True
+        
         self._model = AutoModelForImageTextToText.from_pretrained(
-            model_path, torch_dtype=torch.float16, device_map=device
+            model_path, 
+            torch_dtype=torch.float16, 
+            device_map=device,
+            attn_implementation='sdpa',
+            low_cpu_mem_usage=True
         )
         self._model.eval()
         self._optimizations_applied = []
