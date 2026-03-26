@@ -589,7 +589,15 @@ class VLMModel:
         messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": question}]}]
         inputs = self._processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt").to(self._device)
         with torch.no_grad():
-            output_ids = self._model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, temperature=0.0, top_p=1.0, use_cache=True)
+            output_ids = self._model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=0.0,
+                top_p=1.0,
+                use_cache=True,
+                pad_token_id=self._processor.tokenizer.pad_token_id if hasattr(self._processor.tokenizer, 'pad_token_id') else 0
+            )
         input_len = inputs.input_ids.shape[1]
         generated_ids = output_ids[0][input_len:]
         text = self._processor.tokenizer.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
