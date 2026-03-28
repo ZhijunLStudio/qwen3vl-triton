@@ -26,6 +26,13 @@ try:
 except ImportError:
     _HAS_STATIC_CACHE = False
 
+# 检测 flash-attn 是否可用
+try:
+    import flash_attn
+    _ATTN_IMPL = 'flash_attention_2'
+except ImportError:
+    _ATTN_IMPL = 'eager'
+
 # ==============================================================================
 # 1. Triton RMSNorm
 # ==============================================================================
@@ -245,7 +252,7 @@ class VLMModel:
             model_path,
             torch_dtype=torch.float16,
             device_map=device,
-            attn_implementation='flash_attention_2',
+            attn_implementation=_ATTN_IMPL,
             low_cpu_mem_usage=True
         )
         self._model.eval()
@@ -336,9 +343,14 @@ class VLMModel:
 
     # -------------------------------------------------------------------------
     def _apply_quantization(self):
-        dict_path = "qwen3_2b_int4_fused_packed.pt"
-        if not os.path.exists(dict_path):
-            print(f"[Quant] {dict_path} not found, skipping.")
+        candidates = [
+            "qwen3_2b_int4_fused_packed.pt",
+            os.path.join(os.path.dirname(self.model_path), "qwen3_2b_int4_fused_packed.pt"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen3_2b_int4_fused_packed.pt"),
+        ]
+        dict_path = next((p for p in candidates if os.path.exists(p)), None)
+        if dict_path is None:
+            print("[Quant] qwen3_2b_int4_fused_packed.pt not found, skipping quantization.")
             return
 
         print("[Quant] Loading INT4 fused weights...")
