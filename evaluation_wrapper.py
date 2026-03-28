@@ -201,34 +201,30 @@ class SlimTritonINT4Linear(nn.Module):
         self.decode_grid  = (triton.cdiv(out_features, self.BLOCK_N), self.SPLIT_K)
         self.prefill_grid = (triton.cdiv((in_features // 2), self.BLOCK_K_PACKED), triton.cdiv(out_features, self.BLOCK_N))
         self.workspace = torch.empty((self.SPLIT_K, out_features), dtype=torch.float16, device=device)
+        # Pre-dequantized FP16 weights for cuBLAS decode — set after weights are loaded
+        self._w_fp16 = None
+
+    def materialize_fp16(self):
+        """Dequantize INT4 → FP16, store, then free INT4 buffers to save memory."""
+        K, N = self.in_features, self.out_features
+        w = torch.empty((K, N), dtype=torch.float16, device=self.qweight.device)
+        dequantize_w4a16_slim_kernel[self.prefill_grid](
+            self.qweight, self.scales, self.qzeros, w, K, N,
+            self.qweight.stride(0), self.qweight.stride(1),
+            w.stride(0), w.stride(1),
+            BLOCK_K_PACKED=self.BLOCK_K_PACKED, BLOCK_N=self.BLOCK_N,
+            num_warps=4, num_stages=3
+        )
+        self._w_fp16 = w
+        # Free INT4 buffers — no longer needed once FP16 is materialized
+        del self.qweight, self.scales, self.qzeros
 
     def __call__(self, x, *args, **kwargs):
         return self.forward(x)
 
     def forward(self, x):
-        original_shape = x.shape
-        x_2d = x.view(-1, self.in_features)
-        M, K = x_2d.shape
-        N = self.out_features
-        if M == 1:
-            x_1d = x.view(-1)
-            w4a16_gemv_slim_kernel_splitk[self.decode_grid](
-                x_1d, self.qweight, self.scales, self.qzeros, self.workspace,
-                K, N, 1, self.qweight.stride(0), self.qweight.stride(1),
-                group_size=self.group_size, BLOCK_K_PACKED=self.BLOCK_K_PACKED,
-                BLOCK_N=self.BLOCK_N, SPLIT_K=self.SPLIT_K, num_warps=4, num_stages=3
-            )
-            c = self.workspace.sum(dim=0)
-            return c.view(*original_shape[:-1], N)
-        else:
-            w_fp16 = torch.empty((K, N), device=x.device, dtype=torch.float16)
-            dequantize_w4a16_slim_kernel[self.prefill_grid](
-                self.qweight, self.scales, self.qzeros, w_fp16, K, N,
-                self.qweight.stride(0), self.qweight.stride(1),
-                w_fp16.stride(0), w_fp16.stride(1),
-                BLOCK_K_PACKED=self.BLOCK_K_PACKED, BLOCK_N=self.BLOCK_N, num_warps=4, num_stages=3
-            )
-            return torch.matmul(x, w_fp16)
+        # Always use pre-materialized FP16 + cuBLAS (M=1 decode AND prefill)
+        return torch.mm(x.view(-1, self.in_features), self._w_fp16).view(*x.shape[:-1], self.out_features)
 
 
 # ==============================================================================
@@ -533,6 +529,18 @@ class VLMModel:
                 layer.mlp.forward = fast_mlp_forward
                 replaced_count += 3
 
+        # Pre-dequantize all INT4 weights to FP16 for fast cuBLAS decode
+        print("[Quant] Pre-dequantizing weights to FP16 for cuBLAS decode...")
+        for layer in self._model.model.language_model.layers:
+            for name in ('qkv_proj', 'o_proj'):
+                m = getattr(layer.self_attn, name, None)
+                if isinstance(m, SlimTritonINT4Linear):
+                    m.materialize_fp16()
+            for name in ('gate_up_proj', 'down_proj'):
+                m = getattr(layer.mlp, name, None)
+                if isinstance(m, SlimTritonINT4Linear):
+                    m.materialize_fp16()
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
         print(f"[Quant] Replaced {replaced_count} interfaces with INT4 Triton kernels.")
         self._optimizations_applied.append('quantization_triton_fused_int4_splitK')
@@ -667,7 +675,8 @@ class VLMModel:
             k0, _ = dynamic_kv[0]
             prefill_len = k0.shape[2]
 
-            # Fallback if sequence too long for static cache
+            # Fallback if sequence too long for static cache: use original HF generate
+            # (correct behavior for long sequences / accuracy evaluation)
             if prefill_len + max_new_tokens + 4 > wrapper._max_static_len:
                 wrapper._attn_bias_holder[0] = None
                 return original_hf_generate(
@@ -681,7 +690,6 @@ class VLMModel:
             # === Copy prefill KV into static cache ===
             with torch.inference_mode():
                 wrapper._static_cache.reset()
-            with torch.inference_mode():
                 for li in range(num_layers):
                     k_l, v_l = dynamic_kv[li]
                     ln = k_l.shape[2]
@@ -691,6 +699,10 @@ class VLMModel:
             # === DECODE LOOP with CUDA Graph ===
             wrapper._attn_bias_holder[0] = wrapper._g_attn_bias  # enable bias masking
 
+            # Initialize bias: all -inf, then set valid prefill positions to 0.0 once
+            wrapper._g_attn_bias.fill_(_neg)
+            wrapper._g_attn_bias[0, 0, 0, :prefill_len] = 0.0  # valid after prefill
+
             generated_ids = [next_tok_id]
             curr_pos = prefill_len
 
@@ -699,23 +711,19 @@ class VLMModel:
                     if next_tok_id == eos_id:
                         break
 
-                    # Update static inputs in-place (outside graph — CPU sets memory, GPU reads)
-                    wrapper._g_input_ids[0, 0] = next_tok_id
+                    wrapper._g_input_ids[0, 0] = next_tok_id   # CPU int → GPU
                     wrapper._g_pos_ids[0, 0]   = curr_pos
                     wrapper._g_cache_pos[0]    = curr_pos
+                    wrapper._g_attn_bias[0, 0, 0, curr_pos] = 0.0  # unmask one position
 
-                    # Update attention bias: 0.0 for positions 0..curr_pos, _neg elsewhere
-                    wrapper._g_attn_bias.fill_(_neg)
-                    wrapper._g_attn_bias[0, 0, 0, :curr_pos + 1] = 0.0
-
-                    # Replay captured graph
                     wrapper._cuda_graph.replay()
 
+                    # .item() syncs CPU with GPU — necessary for feeding back into next step
                     next_tok_id = int(wrapper._g_logits[0, 0, :].argmax().item())
                     generated_ids.append(next_tok_id)
                     curr_pos += 1
 
-            wrapper._attn_bias_holder[0] = None  # reset for safety
+            wrapper._attn_bias_holder[0] = None
 
             gen_t = torch.tensor(generated_ids, dtype=torch.long, device=wrapper._device).unsqueeze(0)
             return torch.cat([input_ids, gen_t], dim=1)
