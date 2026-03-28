@@ -352,6 +352,7 @@ class VLMModel:
 
     # -------------------------------------------------------------------------
     def _apply_quantization(self):
+        # 查找 INT4 权重文件（优先当前目录，其次模型目录旁边）
         candidates = [
             "qwen3_2b_int4_fused_packed.pt",
             os.path.join(os.path.dirname(self.model_path), "qwen3_2b_int4_fused_packed.pt"),
@@ -359,7 +360,7 @@ class VLMModel:
         ]
         dict_path = next((p for p in candidates if os.path.exists(p)), None)
         if dict_path is None:
-            print("[Quant] qwen3_2b_int4_fused_packed.pt not found, skipping quantization.")
+            print("[Quant] qwen3_2b_int4_fused_packed.pt not found in any search path, skipping quantization.")
             return
 
         print("[Quant] Loading INT4 fused weights...")
