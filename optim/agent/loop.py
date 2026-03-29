@@ -71,32 +71,55 @@ score = accuracy_ratio × 0.40 + ttft_improvement × 0.30 + throughput_improveme
 6. After every attempt (win or fail): call `add_lesson`
 7. **NEVER compute the score yourself** — it is always provided in the run_benchmark result
 
-## Optimization Strategies (ordered by expected impact)
-**A. Quick Wins (system settings)**
-   - torch.backends.cuda.matmul.allow_tf32 = True
-   - torch.set_float32_matmul_precision('high')
-   - torch.backends.cudnn.benchmark = True
+## ❌ PROVEN FAILURES — DO NOT TRY THESE AGAIN
+These have been tested and all degrade performance on this hardware:
+- torch.backends.cuda.matmul.allow_tf32 / set_float32_matmul_precision / cudnn.benchmark
+- Flash Attention 2 (attn_implementation='flash_attention_2') — incompatible with this model
+- torch.compile with any mode (reduce-overhead, max-autotune) — always degrades
+- BitsAndBytes INT8 / INT4 quantization — breaks generation (TTFT=None)
 
-**B. Attention Speedup**
-   - Flash Attention 2 (`attn_implementation='flash_attention_2'`)
-   - SDPA with memory_efficient_attention backend
+## ✅ Untried Strategies (try these in order)
 
-**C. Compilation**
-   - torch.compile(model, mode='reduce-overhead', fullgraph=False)
+**A. CUDA Graph capture for decode (highest impact)**
+   - After loading model, do a warmup run then capture CUDA graph:
+     ```python
+     # In __init__, after model load:
+     self._warmup()
+     ```
+   - Use `torch.cuda.CUDAGraph()` to capture the forward pass
+   - This eliminates Python overhead on each token generation
 
-**D. Quantization**
-   - BitsAndBytes INT8: load_in_8bit=True
-   - BitsAndBytes INT4: load_in_4bit=True, bnb_4bit_compute_dtype=bfloat16
-   - AWQ / GPTQ if packages available
+**B. Static KV Cache (reduces memory allocation overhead)**
+   - Use `transformers.StaticCache` instead of DynamicCache
+   - Pre-allocate KV cache at init time:
+     ```python
+     from transformers import StaticCache
+     self._model.generation_config.cache_implementation = "static"
+     ```
+   - Combine with `torch.compile(model.forward, mode='reduce-overhead')`
 
-**E. Custom Kernels (Triton)**
-   - Fused RMSNorm
-   - Fused RoPE
-   - Custom attention
+**C. Warmup run at init time**
+   - Add a dummy generation in `__init__` to pre-compile CUDA kernels
+   - Dramatically reduces TTFT for the first real request
+   - Use a short dummy input (1 token) to warm up
 
-**F. KV Cache / Decode**
-   - PagedAttention, sliding window
-   - Speculative decoding
+**D. torch.inference_mode() instead of torch.no_grad()**
+   - `torch.inference_mode()` is strictly faster (disables autograd version counter)
+   - Replace: `with torch.no_grad():` → `with torch.inference_mode():`
+
+**E. Optimize image preprocessing**
+   - Cache processor output if same image appears multiple times
+   - Move image preprocessing to GPU if possible
+   - Use `torch.float16` for image tensors explicitly
+
+**F. Reduce Python overhead in generate()**
+   - Remove unnecessary dict lookups
+   - Pre-compute `pad_token_id` at init time, not every call
+   - Use `inputs_embeds` path to skip re-tokenization overhead
+
+**G. Batch inference with dynamic batching**
+   - If benchmark uses sequential calls, try batching requests
+   - Throughput improves dramatically with batch_size > 1
 
 ## Workflow Per Iteration
 1. `get_status` → understand current state and history
@@ -186,11 +209,13 @@ class AgentLoop:
             sys.exit(1)
 
         baseline = data["metrics"]
-        # Baseline score vs itself = neutral reference point
-        # We store it so future score = compute(metrics, baseline)
+        # Compute baseline score vs itself: only accuracy term is non-zero
+        # (TTFT and TP improvements are both 0 at baseline)
+        baseline["score"] = ScoreEngine.compute(baseline, baseline)
+        current = dict(baseline)
         self.state.update({
             "baseline": baseline,
-            "current":  dict(baseline),
+            "current":  current,
             "best":     dict(baseline),
         })
         self._log(f"Baseline: {ScoreEngine.fmt(baseline)}", "result")
@@ -238,8 +263,35 @@ class AgentLoop:
         delta          = 0.0
         turn           = 0
 
+        bench_called   = False  # has run_benchmark been called this iteration?
+        bash_count     = 0     # bash exploration counter
+
         while turn < self.MAX_TOOL_TURNS:
             turn += 1
+
+            # ── Urgency injection ────────────────────────────────────────────
+            # If we're burning turns on exploration without making a code change,
+            # inject a user message to force action.
+            remaining = self.MAX_TOOL_TURNS - turn
+            if remaining == 8 and not bench_called and not action_summary:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"⚠️ URGENT: {remaining} tool turns remaining. "
+                        "You have NOT yet called run_benchmark this iteration. "
+                        "Stop exploring — commit to ONE code change right now: "
+                        "call edit or write, then run_benchmark, then commit_if_improved or revert_changes. "
+                        "If you cannot decide, revert and call add_lesson."
+                    ),
+                })
+            elif remaining == 3 and not bench_called:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"⚠️ CRITICAL: only {remaining} turns left and no benchmark run yet. "
+                        "Call revert_changes immediately, then add_lesson explaining what you explored."
+                    ),
+                })
 
             # Trim conversation if approaching budget
             messages = trim_messages(messages, self._history_budget)
@@ -303,6 +355,9 @@ class AgentLoop:
 
                     self._log(f"🔧 {name}({list(args.keys())})", "tool")
 
+                    if name == "bash":
+                        bash_count += 1
+
                     result_str = self.executor.execute(name, args)
 
                     # Truncate large results before feeding back
@@ -325,6 +380,7 @@ class AgentLoop:
                         action_summary = f"{name}: {str(args)[:80]}"
 
                     if name == "run_benchmark":
+                        bench_called = True
                         try:
                             d = json.loads(result_str)
                             if d.get("status") == "SUCCESS":

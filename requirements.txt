@@ -21,3 +21,6 @@ triton>=2.1.0
 
 # Flash Attention（必需，代码使用 attn_implementation='flash_attention_2'）
 flash-attn>=2.0.0
+
+
+accelerate

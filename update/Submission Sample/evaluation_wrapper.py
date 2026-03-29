@@ -273,6 +273,8 @@ class VLMModel:
                 print(f"[CUDA Graph] Setup failed ({e}), using standard generate.")
                 import traceback; traceback.print_exc()
                 self._attn_bias_holder[0] = None
+        else:
+            print("[VLMModel] StaticCache not available, skipping CUDA Graph.")
 
         print(f"[VLMModel] Ready on {device}. Opts: {', '.join(self._optimizations_applied)}")
 
@@ -301,6 +303,7 @@ class VLMModel:
             if is_prefill and pixel_values is not None and input_ids is not None:
                 img_hash = self._compute_image_hash(pixel_values)
                 if img_hash in self.llm_kv_cache:
+                    print(f"[KV Cache] Hit for hash {img_hash[:10]}...")
                     self.llm_kv_cache.move_to_end(img_hash)
                     prefix_len   = self.llm_kv_cache_lens[img_hash]
                     cached_cache = self.llm_kv_cache[img_hash]
@@ -308,17 +311,28 @@ class VLMModel:
                     for i in range(len(cached_cache)):
                         k, v = cached_cache[i]
                         new_cache.update(k, v, i)
+                    new_input_ids = input_ids[:, prefix_len:]
+                    new_len = new_input_ids.shape[1]
                     kwargs['past_key_values'] = new_cache
-                    kwargs['input_ids']       = input_ids[:, prefix_len:]
+                    kwargs['input_ids']       = new_input_ids
                     if kwargs.get('position_ids') is not None:
                         kwargs['position_ids'] = kwargs['position_ids'][..., prefix_len:]
-                    if kwargs.get('cache_position') is not None:
-                        kwargs['cache_position'] = kwargs['cache_position'][prefix_len:]
+                    # Always set cache_position explicitly so the model knows where new tokens start
+                    kwargs['cache_position'] = torch.arange(
+                        prefix_len, prefix_len + new_len, device=input_ids.device
+                    )
+                    # IMPORTANT: clear attention_mask to avoid shape mismatch in transformers 5.x.
+                    # Qwen3VLModel.compute_3d_position_ids uses attention_mask.shape to compute
+                    # position_ids — with the full-length mask it produces pos_ids of full length,
+                    # causing cos/sin to have 687 positions while q has only new_len (e.g. 10).
+                    # Setting attention_mask=None lets the model derive positions from cache_position.
+                    kwargs['attention_mask'] = None
                     kwargs['pixel_values'] = None
                     if 'image_grid_thw' in kwargs:
                         kwargs['image_grid_thw'] = None
                     return original_forward(*args, **kwargs)
                 else:
+                    print(f"[KV Cache] Miss for hash {img_hash[:10]}, prefilling...")
                     outputs = original_forward(*args, **kwargs)
                     vision_end_mask = (input_ids[0] == 151653).nonzero(as_tuple=True)[0]
                     if (len(vision_end_mask) > 0
@@ -329,9 +343,14 @@ class VLMModel:
                         # transformers 4.36+: past_key_values is DynamicCache, not tuple
                         if isinstance(outputs.past_key_values, DynamicCache):
                             for i in range(len(outputs.past_key_values)):
-                                layer = outputs.past_key_values.layers[i]
-                                k = layer.keys[:, :, :prefix_len, :]
-                                v = layer.values[:, :, :prefix_len, :]
+                                # transformers 5.x uses .key_cache[i]; 4.36-4.x uses .layers[i].keys
+                                if hasattr(outputs.past_key_values, 'key_cache'):
+                                    k = outputs.past_key_values.key_cache[i][:, :, :prefix_len, :]
+                                    v = outputs.past_key_values.value_cache[i][:, :, :prefix_len, :]
+                                else:
+                                    layer = outputs.past_key_values.layers[i]
+                                    k = layer.keys[:, :, :prefix_len, :]
+                                    v = layer.values[:, :, :prefix_len, :]
                                 new_cache.append((k, v))
                         else:
                             # Fallback for older transformers (tuple/list)
@@ -352,7 +371,6 @@ class VLMModel:
 
     # -------------------------------------------------------------------------
     def _apply_quantization(self):
-        # 查找 INT4 权重文件（优先当前目录，其次模型目录旁边）
         candidates = [
             "qwen3_2b_int4_fused_packed.pt",
             os.path.join(os.path.dirname(self.model_path), "qwen3_2b_int4_fused_packed.pt"),
@@ -360,21 +378,19 @@ class VLMModel:
         ]
         dict_path = next((p for p in candidates if os.path.exists(p)), None)
         if dict_path is None:
-            print("[Quant] qwen3_2b_int4_fused_packed.pt not found in any search path, skipping quantization.")
+            print("[Quant] qwen3_2b_int4_fused_packed.pt not found, skipping quantization.")
             return
 
         print("[Quant] Loading INT4 fused weights...")
         quant_dict = torch.load(dict_path, map_location=self._device)
         replaced_count = 0
 
-        # Class-level: replace RMSNorm and RoPE globally
+        # Class-level: replace RMSNorm globally
         RMSNormClass = type(self._model.model.language_model.layers[0].input_layernorm)
         RMSNormClass.forward = custom_rmsnorm_forward
-
-        AttnClass   = type(self._model.model.language_model.layers[0].self_attn)
-        attn_module = sys.modules[AttnClass.__module__]
-        if hasattr(attn_module, 'apply_rotary_pos_emb'):
-            attn_module.apply_rotary_pos_emb = fast_apply_rotary_pos_emb
+        # NOTE: Do NOT patch module-level apply_rotary_pos_emb — transformers 5.x changed
+        # cos/sin shapes and the patch causes shape mismatches during prefill.
+        # The fused RoPE is applied directly in fast_attn_forward's decode path only.
 
         # Proxy classes
         class FastProxy(nn.Module):
@@ -580,7 +596,15 @@ class VLMModel:
           - _g_attn_bias: updated in-place before each replay to mask padding
           - Prefill still uses the original model.forward (DynamicCache, vision)
           - Prefill KV is copied into the static cache before decode loop
+
+        Requires: quantization must be applied first, because:
+          - In transformers 5.x, flash_attention calls ops not allowed during capture
+          - Our fast_attn_forward (installed by quantization) avoids flash_attention
+            in the single-token decode path, making graph capture safe.
         """
+        if 'quantization_triton_fused_int4_splitK' not in self._optimizations_applied:
+            print("[CUDA Graph] Skipping: requires INT4 quantization for flash-attention-free capture path")
+            return
         lm        = self._model.model.language_model  # base transformer (Qwen3Model)
         lm_head   = self._model.lm_head               # LM head linear: hidden → vocab
         lm_config = lm.config
@@ -680,6 +704,7 @@ class VLMModel:
             if not wrapper._graph_ready or max_new_tokens <= 1:
                 # TTFT path (max_new_tokens=1) or graph not ready: use original HF generate
                 wrapper._attn_bias_holder[0] = None
+                print(f"[Generate] Fallback to HF (max_new_tokens={max_new_tokens}, graph_ready={wrapper._graph_ready})")
                 return original_hf_generate(
                     input_ids=input_ids, attention_mask=attention_mask,
                     pixel_values=pixel_values, image_grid_thw=image_grid_thw,
@@ -703,14 +728,15 @@ class VLMModel:
             next_tok_id = int(prefill_out.logits[:, -1, :].argmax(dim=-1).item())
             dynamic_kv  = prefill_out.past_key_values
 
-            # Actual prefill length from KV (may differ from input_ids length due to vision tokens)
-            k0, _ = dynamic_kv[0]
-            prefill_len = k0.shape[2]
+            # Actual prefill length from KV — use .layers[i].keys for transformers 4.x and 5.x
+            # (DynamicCache.__getitem__ was removed in transformers 5.x)
+            prefill_len = dynamic_kv.layers[0].keys.shape[2]
 
             # Fallback if sequence too long for static cache: use original HF generate
             # (correct behavior for long sequences / accuracy evaluation)
             if prefill_len + max_new_tokens + 4 > wrapper._max_static_len:
                 wrapper._attn_bias_holder[0] = None
+                print(f"[Generate] Seq too long ({prefill_len} + {max_new_tokens} > {wrapper._max_static_len}), fallback to HF")
                 return original_hf_generate(
                     input_ids=input_ids, attention_mask=attention_mask,
                     pixel_values=pixel_values, image_grid_thw=image_grid_thw,
@@ -723,10 +749,17 @@ class VLMModel:
             with torch.inference_mode():
                 wrapper._static_cache.reset()
                 for li in range(num_layers):
-                    k_l, v_l = dynamic_kv[li]
+                    # Use .layers[i].keys for both transformers 4.x and 5.x
+                    k_l = dynamic_kv.layers[li].keys
+                    v_l = dynamic_kv.layers[li].values
                     ln = k_l.shape[2]
-                    wrapper._static_cache.layers[li].keys[:, :, :ln, :].copy_(k_l)
-                    wrapper._static_cache.layers[li].values[:, :, :ln, :].copy_(v_l)
+                    # StaticCache: transformers 5.x uses .key_cache[i]; 4.x uses .layers[i].keys
+                    if hasattr(wrapper._static_cache, 'key_cache'):
+                        wrapper._static_cache.key_cache[li][:, :, :ln, :].copy_(k_l)
+                        wrapper._static_cache.value_cache[li][:, :, :ln, :].copy_(v_l)
+                    else:
+                        wrapper._static_cache.layers[li].keys[:, :, :ln, :].copy_(k_l)
+                        wrapper._static_cache.layers[li].values[:, :, :ln, :].copy_(v_l)
 
             # === DECODE LOOP with CUDA Graph ===
             wrapper._attn_bias_holder[0] = wrapper._g_attn_bias  # enable bias masking
